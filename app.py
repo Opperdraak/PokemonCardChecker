@@ -4,6 +4,7 @@ import os
 import re
 import sqlite3
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
@@ -223,12 +224,35 @@ def normalize(value: str) -> str:
     return " ".join(value.strip().lower().split())
 
 
-def normalized_card_number_candidates(value: str) -> set[str]:
+def parse_card_number(value: str) -> dict[str, Any]:
     cleaned = value.strip().upper().replace(" ", "")
+    base = cleaned.split("/", 1)[0]
+    match = re.fullmatch(r"([A-Z]*)(\d+)", base)
+
+    if not match:
+        return {
+            "raw": cleaned,
+            "base": base,
+            "prefix": "",
+            "digits": None,
+        }
+
+    prefix, digits = match.groups()
+    return {
+        "raw": cleaned,
+        "base": base,
+        "prefix": prefix,
+        "digits": int(digits),
+    }
+
+
+def normalized_card_number_candidates(value: str) -> set[str]:
+    parts = parse_card_number(value)
+    cleaned = parts["raw"]
     if not cleaned:
         return set()
 
-    candidates = {cleaned}
+    candidates = {cleaned, parts["base"]}
 
     if "/" in cleaned:
         candidates.add(cleaned.split("/", 1)[0])
@@ -243,6 +267,7 @@ def normalized_card_number_candidates(value: str) -> set[str]:
         if match:
             prefix, digits = match.groups()
             expanded.add(f"{prefix}{int(digits)}")
+            expanded.add(str(int(digits)))
 
     return {candidate for candidate in expanded if candidate}
 
@@ -253,7 +278,155 @@ def card_number_matches(user_number: str, api_number: str) -> bool:
     return bool(user_candidates and api_candidates and user_candidates & api_candidates)
 
 
-def lookup_pokemon_card(card_name: str, card_number: str, api_key: str) -> dict[str, Any]:
+def score_card_number_similarity(user_number: str, api_number: str) -> int:
+    if card_number_matches(user_number, api_number):
+        return 1_000
+
+    user_parts = parse_card_number(user_number)
+    api_parts = parse_card_number(api_number)
+    score = int(
+        SequenceMatcher(None, user_parts["raw"], api_parts["raw"]).ratio() * 300
+    )
+
+    user_digits = user_parts["digits"]
+    api_digits = api_parts["digits"]
+    if user_digits is not None and api_digits is not None:
+        difference = abs(user_digits - api_digits)
+        score += max(0, 240 - min(difference, 24) * 10)
+
+    user_prefix = user_parts["prefix"]
+    api_prefix = api_parts["prefix"]
+    if user_prefix and api_prefix and user_prefix == api_prefix:
+        score += 60
+    elif not user_prefix or not api_prefix:
+        score += 30
+
+    return score
+
+
+def score_card_name_similarity(user_name: str, api_name: str) -> int:
+    normalized_user_name = normalize(user_name)
+    normalized_api_name = normalize(api_name)
+
+    if normalized_user_name == normalized_api_name:
+        return 200
+    if normalized_user_name in normalized_api_name or normalized_api_name in normalized_user_name:
+        return 150
+    return int(SequenceMatcher(None, normalized_user_name, normalized_api_name).ratio() * 100)
+
+
+def build_candidate_label(candidate: dict[str, Any]) -> str:
+    parts = [f'{candidate["name"]} #{candidate["number"]}']
+    if candidate.get("set_name"):
+        parts.append(candidate["set_name"])
+    if candidate.get("release_date"):
+        parts.append(candidate["release_date"])
+    return " | ".join(parts)
+
+
+def build_card_candidate(
+    card: dict[str, Any],
+    requested_name: str,
+    requested_number: str,
+) -> dict[str, Any]:
+    cardmarket = card.get("cardmarket") or {}
+    prices = cardmarket.get("prices") or {}
+    card_number = card.get("number", "")
+    candidate = {
+        "id": card.get("id"),
+        "name": card.get("name"),
+        "number": card_number,
+        "set_name": (card.get("set") or {}).get("name"),
+        "release_date": (card.get("set") or {}).get("releaseDate"),
+        "cardmarket_url": cardmarket.get("url"),
+        "cardmarket_updated_at": cardmarket.get("updatedAt"),
+        "trend_price": prices.get("trendPrice"),
+        "average_sell_price": prices.get("averageSellPrice"),
+        "low_price": prices.get("lowPrice"),
+        "is_exact_name_match": normalize(card.get("name", "")) == normalize(requested_name),
+        "is_exact_number_match": card_number_matches(requested_number, card_number),
+    }
+    candidate["match_score"] = (
+        score_card_number_similarity(requested_number, card_number) * 10
+        + score_card_name_similarity(requested_name, card.get("name", ""))
+    )
+    candidate["label"] = build_candidate_label(candidate)
+    return candidate
+
+
+def choose_best_candidate(
+    requested_name: str,
+    requested_number: str,
+    cards: list[dict[str, Any]],
+    preferred_card_id: str | None = None,
+) -> dict[str, Any]:
+    candidates = [
+        build_card_candidate(card, requested_name, requested_number)
+        for card in cards
+    ]
+    candidates.sort(
+        key=lambda candidate: (
+            candidate["match_score"],
+            candidate.get("release_date") or "",
+            candidate["label"],
+        ),
+        reverse=True,
+    )
+
+    visible_candidates = candidates[:5]
+    selected_candidate = visible_candidates[0]
+    exact_candidate_count = sum(
+        1
+        for candidate in visible_candidates
+        if candidate["is_exact_name_match"] and candidate["is_exact_number_match"]
+    )
+    selection_mode = (
+        "exact"
+        if selected_candidate["is_exact_name_match"]
+        and selected_candidate["is_exact_number_match"]
+        else "closest"
+    )
+
+    if preferred_card_id:
+        preferred_candidate = next(
+            (candidate for candidate in visible_candidates if candidate["id"] == preferred_card_id),
+            None,
+        )
+        if preferred_candidate:
+            selected_candidate = preferred_candidate
+            selection_mode = "manual"
+
+    selection_note = None
+    show_candidate_options = selection_mode != "exact" or exact_candidate_count > 1
+
+    if exact_candidate_count > 1:
+        selection_note = (
+            "Multiple close Cardmarket matches were found. "
+            "Choose the exact card below if needed."
+        )
+    elif selection_mode == "closest":
+        selection_note = (
+            "Closest Cardmarket match selected automatically. "
+            "Choose a different option below if needed."
+        )
+    elif selection_mode == "manual":
+        selection_note = "Using your selected Cardmarket candidate."
+
+    return {
+        "selected_card": selected_candidate,
+        "candidate_cards": visible_candidates,
+        "selection_mode": selection_mode,
+        "selection_note": selection_note,
+        "show_candidate_options": show_candidate_options,
+    }
+
+
+def lookup_pokemon_card(
+    card_name: str,
+    card_number: str,
+    api_key: str,
+    preferred_card_id: str | None = None,
+) -> dict[str, Any]:
     query = f'name:"{escape_query_value(card_name)}"'
     response = requests.get(
         POKEMON_TCG_CARDS_URL,
@@ -280,48 +453,12 @@ def lookup_pokemon_card(card_name: str, card_number: str, api_key: str) -> dict[
             f'No Pokemon TCG card was found for "{card_name}" with number "{card_number}".'
         )
 
-    normalized_name = normalize(card_name)
-    number_matches = [
-        card for card in cards if card_number_matches(card_number, card.get("number", ""))
-    ]
-    exact_matches = [
-        card
-        for card in number_matches
-        if normalize(card.get("name", "")) == normalized_name
-    ]
-    partial_name_matches = [
-        card
-        for card in number_matches
-        if normalized_name in normalize(card.get("name", ""))
-    ]
-
-    if exact_matches:
-        selected_card = exact_matches[0]
-    elif partial_name_matches:
-        selected_card = partial_name_matches[0]
-    elif number_matches:
-        selected_card = number_matches[0]
-    else:
-        raise ExternalAPIError(
-            f'No Pokemon TCG card matched name "{card_name}" and number "{card_number}". '
-            "Try the printed card number only, for example `4` instead of `4/102`."
-        )
-
-    cardmarket = selected_card.get("cardmarket") or {}
-    prices = cardmarket.get("prices") or {}
-
-    return {
-        "id": selected_card.get("id"),
-        "name": selected_card.get("name"),
-        "number": selected_card.get("number"),
-        "set_name": (selected_card.get("set") or {}).get("name"),
-        "release_date": (selected_card.get("set") or {}).get("releaseDate"),
-        "cardmarket_url": cardmarket.get("url"),
-        "cardmarket_updated_at": cardmarket.get("updatedAt"),
-        "trend_price": prices.get("trendPrice"),
-        "average_sell_price": prices.get("averageSellPrice"),
-        "low_price": prices.get("lowPrice"),
-    }
+    return choose_best_candidate(
+        card_name,
+        card_number,
+        cards,
+        preferred_card_id=preferred_card_id,
+    )
 
 
 def compute_average_total_price(listings: list[dict[str, Any]]) -> float | None:
@@ -394,6 +531,41 @@ def render_metrics(card_data: dict[str, Any], ebay_average: float | None) -> Non
         st.markdown(f'[Open Cardmarket record]({card_data["cardmarket_url"]})')
 
 
+def queue_candidate_selection() -> None:
+    st.session_state["preferred_card_id"] = st.session_state["candidate_choice"]
+    st.session_state["run_search"] = True
+
+
+def render_card_candidates(result: dict[str, Any]) -> None:
+    candidate_cards = result.get("card_candidates", [])
+    selected_card_id = result.get("selected_card_id")
+    selection_mode = result.get("card_selection_mode")
+    selection_note = result.get("card_selection_note")
+    show_candidate_options = result.get("show_candidate_options", False)
+
+    if selection_note:
+        st.info(selection_note)
+
+    if len(candidate_cards) < 2 or not show_candidate_options:
+        return
+
+    st.subheader("Possible Cardmarket Matches")
+
+    candidate_map = {candidate["id"]: candidate for candidate in candidate_cards}
+    candidate_ids = list(candidate_map)
+
+    if st.session_state.get("candidate_choice") not in candidate_ids:
+        st.session_state["candidate_choice"] = selected_card_id
+
+    st.radio(
+        "Select the card you actually want to track",
+        options=candidate_ids,
+        key="candidate_choice",
+        format_func=lambda candidate_id: candidate_map[candidate_id]["label"],
+        on_change=queue_candidate_selection,
+    )
+
+
 def render_ebay_table(listings: list[dict[str, Any]]) -> None:
     if not listings:
         st.info("No matching eBay UK listings were returned for this query.")
@@ -434,13 +606,41 @@ def validate_inputs(card_name: str, card_number: str) -> None:
         raise AppError("Enter a card number before running a search.")
 
 
-def run_search(card_name: str, card_number: str) -> dict[str, Any]:
+def run_search(
+    card_name: str,
+    card_number: str,
+    preferred_card_id: str | None = None,
+) -> dict[str, Any]:
     validate_inputs(card_name, card_number)
 
-    search_query = f"{card_name} {card_number}".strip()
     warnings: list[str] = []
     ebay_listings: list[dict[str, Any]] = []
     cardmarket_data: dict[str, Any] | None = None
+    card_candidates: list[dict[str, Any]] = []
+    card_selection_mode = "unavailable"
+    card_selection_note = None
+
+    search_query = f"{card_name} {card_number}".strip()
+    pokemon_tcg_api_key = get_optional_env("POKEMON_TCG_API_KEY")
+    if pokemon_tcg_api_key:
+        try:
+            card_lookup = lookup_pokemon_card(
+                card_name,
+                card_number,
+                pokemon_tcg_api_key,
+                preferred_card_id=preferred_card_id,
+            )
+            cardmarket_data = card_lookup["selected_card"]
+            card_candidates = card_lookup["candidate_cards"]
+            card_selection_mode = card_lookup["selection_mode"]
+            card_selection_note = card_lookup["selection_note"]
+            search_query = f'{cardmarket_data["name"]} {cardmarket_data["number"]}'.strip()
+        except (AppError, requests.RequestException) as error:
+            warnings.append(f"Cardmarket lookup unavailable: {error}")
+    else:
+        warnings.append(
+            "Cardmarket lookup skipped: add `POKEMON_TCG_API_KEY` to `.env` to enable Pokemon TCG pricing."
+        )
 
     ebay_client_id = get_optional_env("EBAY_CLIENT_ID")
     ebay_client_secret = get_optional_env("EBAY_CLIENT_SECRET")
@@ -453,17 +653,6 @@ def run_search(card_name: str, card_number: str) -> dict[str, Any]:
     else:
         warnings.append(
             "eBay search skipped: add `EBAY_CLIENT_ID` and `EBAY_CLIENT_SECRET` to `.env` to enable UK listings."
-        )
-
-    pokemon_tcg_api_key = get_optional_env("POKEMON_TCG_API_KEY")
-    if pokemon_tcg_api_key:
-        try:
-            cardmarket_data = lookup_pokemon_card(card_name, card_number, pokemon_tcg_api_key)
-        except (AppError, requests.RequestException) as error:
-            warnings.append(f"Cardmarket lookup unavailable: {error}")
-    else:
-        warnings.append(
-            "Cardmarket lookup skipped: add `POKEMON_TCG_API_KEY` to `.env` to enable Pokemon TCG pricing."
         )
 
     if not ebay_listings and not cardmarket_data:
@@ -494,6 +683,11 @@ def run_search(card_name: str, card_number: str) -> dict[str, Any]:
         "ebay_listings": ebay_listings,
         "ebay_average": ebay_average,
         "cardmarket_data": cardmarket_data,
+        "card_candidates": card_candidates,
+        "selected_card_id": cardmarket_data["id"] if cardmarket_data else None,
+        "card_selection_mode": card_selection_mode,
+        "card_selection_note": card_selection_note,
+        "show_candidate_options": card_lookup["show_candidate_options"] if cardmarket_data else False,
         "warnings": warnings,
     }
 
@@ -517,11 +711,14 @@ def main() -> None:
     st.session_state.setdefault("card_number_input", "")
     st.session_state.setdefault("run_search", False)
     st.session_state.setdefault("pending_history_search", None)
+    st.session_state.setdefault("preferred_card_id", None)
 
     pending_history_search = st.session_state.pop("pending_history_search", None)
     if pending_history_search:
         st.session_state["card_name_input"] = pending_history_search["card_name"]
         st.session_state["card_number_input"] = pending_history_search["card_number"]
+        st.session_state["preferred_card_id"] = None
+        st.session_state.pop("candidate_choice", None)
         st.session_state["run_search"] = True
 
     history = fetch_history()
@@ -542,15 +739,22 @@ def main() -> None:
         )
 
     if st.button("Search", type="primary"):
+        st.session_state["preferred_card_id"] = None
+        st.session_state.pop("candidate_choice", None)
         st.session_state["run_search"] = True
 
     if st.session_state.pop("run_search", False):
         card_name = st.session_state.get("card_name_input", "").strip()
         card_number = st.session_state.get("card_number_input", "").strip()
+        preferred_card_id = st.session_state.get("preferred_card_id")
 
         try:
             with st.spinner("Fetching eBay and Cardmarket data..."):
-                st.session_state["latest_result"] = run_search(card_name, card_number)
+                st.session_state["latest_result"] = run_search(
+                    card_name,
+                    card_number,
+                    preferred_card_id=preferred_card_id,
+                )
         except AppError as error:
             st.session_state.pop("latest_result", None)
             st.error(str(error))
@@ -572,6 +776,7 @@ def main() -> None:
     ebay_listings = result["ebay_listings"]
     ebay_average = result["ebay_average"]
     query = result["query"]
+    render_card_candidates(result)
 
     if card_data:
         st.subheader(f'{card_data["name"]} #{card_data["number"]}')
