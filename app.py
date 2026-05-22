@@ -7,7 +7,6 @@ import xml.etree.ElementTree as ET
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from statistics import median
 from typing import Any
 
 import pandas as pd
@@ -48,6 +47,21 @@ def inject_styles() -> None:
             border-radius: 12px;
             padding: 0.7rem 0.8rem;
             min-height: 88px;
+        }
+
+        .trend-card-positive {
+            border-color: #1f7a4d;
+            background: #1b2d24;
+        }
+
+        .trend-card-negative {
+            border-color: #8b2e3b;
+            background: #322028;
+        }
+
+        .trend-card-reverse {
+            border-color: #2563eb;
+            background: #172554;
         }
 
         .trend-card-label {
@@ -113,6 +127,12 @@ def get_optional_env(name: str) -> str | None:
 
     if not value or value.upper() in {"PENDING", "(PENDING)"}:
         return None
+    return value
+
+
+def first_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else None
     return value
 
 
@@ -274,15 +294,21 @@ def search_ebay_listings(query: str, access_token: str, limit: int = 25) -> list
 
         listings.append(
             {
-                "Title": item.get("title", "Untitled listing"),
-                "Condition": item.get("condition"),
+                "Date Posted": item.get("itemCreationDate"),
+                "Item Name": item.get("title", "Untitled listing"),
                 "Price": price_value,
-                "Price Currency": price_currency,
                 "Shipping": shipping_value,
-                "Shipping Currency": shipping_currency or price_currency,
+                "Shipping Display": (
+                    "Free"
+                    if shipping_value in (0, 0.0)
+                    else format_currency(shipping_value, "GBP")
+                    if shipping_value is not None
+                    else "N/A"
+                ),
+                "Final Price": total_value,
+                "Link": item.get("itemWebUrl"),
+                "Title": item.get("title", "Untitled listing"),
                 "Total": total_value,
-                "Total Currency": price_currency,
-                "Listing URL": item.get("itemWebUrl"),
             }
         )
 
@@ -600,6 +626,22 @@ def format_currency(value: float | None, currency: str) -> str:
     return f"{prefix} {value:,.2f}"
 
 
+def compute_ratio(cardmarket_average_sell: float | None, ebay_average_ask: float | None) -> float | None:
+    if (
+        cardmarket_average_sell is None
+        or ebay_average_ask is None
+        or cardmarket_average_sell <= 0
+    ):
+        return None
+    return round(ebay_average_ask / cardmarket_average_sell, 2)
+
+
+def format_ratio(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return f"{value:.2f}x"
+
+
 def format_history_label(entry: dict[str, Any]) -> str:
     timestamp = entry["searched_at"]
     try:
@@ -618,9 +660,13 @@ def render_price_cards(
 ) -> None:
     column_blocks = container.columns(columns, gap="small")
     for column, card in zip(column_blocks, cards):
+        card_class = card.get("card_class", "").strip()
+        combined_class = "trend-card"
+        if card_class:
+            combined_class = f"{combined_class} {card_class}"
         column.markdown(
             (
-                '<div class="trend-card">'
+                f'<div class="{combined_class}">'
                 f'<div class="trend-card-label">{card["label"]}</div>'
                 f'<div class="trend-card-value">{card["value"]}</div>'
                 "</div>"
@@ -651,17 +697,28 @@ def render_sidebar(history: list[dict[str, Any]]) -> None:
 
 
 def render_metrics(card_data: dict[str, Any], ebay_average: float | None) -> None:
+    ratio = compute_ratio(card_data["average_sell_price"], ebay_average)
+    ratio_class = ""
+    if ratio is not None:
+        ratio_class = "trend-card-positive" if ratio >= 5 else "trend-card-negative"
+
     render_price_cards(
         [
-            {"label": "Trend Price", "value": format_currency(card_data["trend_price"], "GBP")},
             {
-                "label": "Average Sell",
+                "label": "Avg Sell Cardmarket",
                 "value": format_currency(card_data["average_sell_price"], "GBP"),
             },
-            {"label": "Low Price", "value": format_currency(card_data["low_price"], "GBP")},
-            {"label": "eBay Avg Ask", "value": format_currency(ebay_average, "GBP")},
+            {
+                "label": "Avg Ask eBay (Incl Shipping)",
+                "value": format_currency(ebay_average, "GBP"),
+            },
+            {
+                "label": "Ratio",
+                "value": format_ratio(ratio),
+                "card_class": ratio_class,
+            },
         ],
-        columns=4,
+        columns=3,
     )
 
     details = []
@@ -689,7 +746,7 @@ def render_cardmarket_trend_metrics(card_data: dict[str, Any]) -> None:
         return
 
     st.markdown('<div class="result-gap"></div>', unsafe_allow_html=True)
-    st.subheader("Cardmarket 7D / 30D Trends")
+    st.subheader("Cardmarket 7D / 30D Averages")
     render_price_cards(
         [
             {"label": "7D Average", "value": format_currency(card_data.get("avg_7_day"), "GBP")},
@@ -700,10 +757,12 @@ def render_cardmarket_trend_metrics(card_data: dict[str, Any]) -> None:
             {
                 "label": "Reverse Holo 7D",
                 "value": format_currency(card_data.get("reverse_holo_avg_7_day"), "GBP"),
+                "card_class": "trend-card-reverse",
             },
             {
                 "label": "Reverse Holo 30D",
                 "value": format_currency(card_data.get("reverse_holo_avg_30_day"), "GBP"),
+                "card_class": "trend-card-reverse",
             },
         ],
         columns=4,
@@ -754,79 +813,25 @@ def render_card_image(card_data: dict[str, Any], container: Any = st) -> None:
         )
 
 
-def compute_ebay_offer_stats(listings: list[dict[str, Any]]) -> dict[str, Any] | None:
+def render_ebay_active_items_table(listings: list[dict[str, Any]]) -> None:
     if not listings:
-        return None
-
-    offer_prices = [item["Price"] for item in listings if item.get("Price") is not None]
-    shipping_prices = [item["Shipping"] for item in listings if item.get("Shipping") is not None]
-    total_prices = [item["Total"] for item in listings if item.get("Total") is not None]
-
-    if not total_prices:
-        return None
-
-    return {
-        "offer_count": len(total_prices),
-        "lowest_total": min(total_prices),
-        "median_total": median(total_prices),
-        "average_total": round(sum(total_prices) / len(total_prices), 2),
-        "highest_total": max(total_prices),
-        "average_price": round(sum(offer_prices) / len(offer_prices), 2) if offer_prices else None,
-        "average_shipping": (
-            round(sum(shipping_prices) / len(shipping_prices), 2) if shipping_prices else None
-        ),
-    }
-
-
-def render_ebay_offer_summary(listings: list[dict[str, Any]]) -> None:
-    if not listings:
-        st.info("No matching eBay UK offers were returned for this query.")
+        st.info("No eBay UK active listings were returned for this query.")
         return
-
-    offer_stats = compute_ebay_offer_stats(listings)
-    if not offer_stats:
-        st.info("eBay returned listings, but there was not enough price data to summarize them.")
-        return
-
-    render_price_cards(
-        [
-            {"label": "Offers", "value": str(offer_stats["offer_count"])},
-            {"label": "Lowest Ask", "value": format_currency(offer_stats["lowest_total"], "GBP")},
-            {"label": "Median Ask", "value": format_currency(offer_stats["median_total"], "GBP")},
-            {
-                "label": "Average Ask",
-                "value": format_currency(offer_stats["average_total"], "GBP"),
-            },
-            {"label": "Highest Ask", "value": format_currency(offer_stats["highest_total"], "GBP")},
-        ],
-        columns=5,
-    )
-
-    summary_bits = []
-    if offer_stats.get("average_price") is not None:
-        summary_bits.append(
-            f'Average card-only price: {format_currency(offer_stats["average_price"], "GBP")}'
-        )
-    if offer_stats.get("average_shipping") is not None:
-        summary_bits.append(
-            f'Average shipping: {format_currency(offer_stats["average_shipping"], "GBP")}'
-        )
-    if summary_bits:
-        st.caption(" | ".join(summary_bits))
 
     dataframe = pd.DataFrame(listings)
-    display_df = dataframe[["Condition", "Price", "Shipping", "Total"]].copy()
-    display_df.insert(0, "Offer #", range(1, len(display_df) + 1))
-    display_df.sort_values(by=["Total", "Price"], inplace=True, na_position="last")
+    display_df = dataframe[
+        ["Date Posted", "Item Name", "Price", "Shipping Display", "Final Price", "Link"]
+    ].copy()
+    display_df.sort_values(by=["Date Posted"], ascending=False, inplace=True, na_position="last")
     display_df.reset_index(drop=True, inplace=True)
-    display_df["Offer #"] = range(1, len(display_df) + 1)
 
     column_config: dict[str, Any] = {
-        "Offer #": st.column_config.NumberColumn("Offer #", format="%d"),
-        "Condition": st.column_config.TextColumn("Condition", width="medium"),
-        "Price": st.column_config.NumberColumn("Card Price (GBP)", format="%.2f"),
-        "Shipping": st.column_config.NumberColumn("Shipping (GBP)", format="%.2f"),
-        "Total": st.column_config.NumberColumn("Total Ask (GBP)", format="%.2f"),
+        "Date Posted": st.column_config.DatetimeColumn("Date Posted", format="DD/MM/YYYY HH:mm"),
+        "Item Name": st.column_config.TextColumn("Item Name", width="large"),
+        "Price": st.column_config.NumberColumn("Price (£)", format="%.2f"),
+        "Shipping Display": st.column_config.TextColumn("Shipping", width="small"),
+        "Final Price": st.column_config.NumberColumn("Final Price (£)", format="%.2f"),
+        "Link": st.column_config.LinkColumn("Link", display_text="Open item"),
     }
 
     st.dataframe(
@@ -896,7 +901,7 @@ def run_search(
     if ebay_client_id and ebay_client_secret:
         try:
             access_token = get_ebay_access_token(ebay_client_id, ebay_client_secret)
-            ebay_listings = search_ebay_listings(search_query, access_token)
+            ebay_listings = search_ebay_listings(search_query, access_token, limit=10)
         except (AppError, requests.RequestException) as error:
             warnings.append(f"eBay search unavailable: {error}")
     else:
@@ -954,7 +959,7 @@ def main() -> None:
     st.title("Pokemon Card Price Tracker")
     st.write(
         "Search a card by name and number to compare Pokemon TCG Cardmarket prices "
-        "with current eBay UK offer prices."
+        "with current eBay UK listings."
     )
 
     st.session_state.setdefault("card_name_input", "")
@@ -1047,8 +1052,8 @@ def main() -> None:
         st.info("No Cardmarket data is available for this search.")
 
     st.markdown('<div class="result-gap"></div>', unsafe_allow_html=True)
-    st.subheader("Current eBay UK Offer Prices")
-    render_ebay_offer_summary(ebay_listings)
+    st.subheader("Latest eBay UK Listings")
+    render_ebay_active_items_table(ebay_listings)
 
 
 if __name__ == "__main__":

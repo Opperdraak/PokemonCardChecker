@@ -1,5 +1,4 @@
 # PokemonCardChecker
-Checks the prices of pokemon cards
 
 Local Streamlit app for checking Pokemon card prices using:
 
@@ -106,3 +105,11 @@ Then open:
 - `requirements.txt`: Python dependencies
 - `.env.example`: example environment file
 - `history.db`: local SQLite history database, created automatically
+
+## Development
+
+Run a quick syntax check:
+
+```bash
+python3 -m py_compile app.py
+```
